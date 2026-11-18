@@ -1,1 +1,141 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
 
+
+gamma = 1.4
+R     = 296.8           
+
+P_tank1 = 100e5          
+T_tank1 = 300.0
+
+V       = 0.00445        
+
+
+P_reg   = 8e5           
+D_exit  = 1e-2             
+P_atm   = 1.01325e5
+
+
+t_end   = 10.0           
+n_pts   = 10001
+
+
+A_e      = np.pi / 4 * D_exit**2
+PR_crit  = ((gamma + 1) / 2)**(gamma / (gamma - 1))  
+P_o_crit = PR_crit * P_atm                           
+rho_1    = P_tank1 / (R * T_tank1)
+m_1      = rho_1 * V
+
+def evaluate_state(P_tank):
+   
+    P_tank = np.maximum(P_tank, P_atm)
+    
+
+    T_tank   = T_tank1 * (P_tank / P_tank1)**((gamma - 1) / gamma)
+    rho_tank = P_tank / (R * T_tank)
+    
+   
+    P_o = np.minimum(P_tank, P_reg)
+    T_o = 300
+    
+    
+    P_e   = np.maximum(P_o / PR_crit, P_atm)
+    M_e   = np.sqrt(np.maximum(2 / (gamma - 1) * ((P_o / P_e)**((gamma - 1) / gamma) - 1), 0.0))
+    T_e   = T_o / (1 + (gamma - 1) / 2 * M_e**2)
+    V_e   = M_e * np.sqrt(gamma * R * T_e)
+    rho_e = P_e / (R * T_e)
+    
+    mdot   = rho_e * A_e * V_e
+    thrust = mdot * V_e + (P_e - P_atm) * A_e
+    
+    return {
+        "P_tank": P_tank, "T_tank": T_tank, "rho_tank": rho_tank,
+        "P_o": P_o, "P_e": P_e, "M_e": M_e, "V_e": V_e,
+        "mdot": mdot, "thrust": thrust
+    }
+
+def ode_system(t, y):
+    
+    P_tank = y[0]
+    if P_tank <= P_atm:
+        return [0.0]
+    st = evaluate_state(P_tank)
+    return [-st["mdot"] * gamma * st["P_tank"] / (V * st["rho_tank"])]
+
+
+def event_reg_dropout(t, y):
+    return y[0] - P_reg  
+
+def event_unchoke(t, y):
+    return min(y[0], P_reg) - P_o_crit  
+
+
+t = np.linspace(0, t_end, n_pts)
+sol = solve_ivp(
+    ode_system, (0, t_end), [P_tank1],
+    t_eval=t, method="RK45", events=[event_reg_dropout, event_unchoke],
+    rtol=1e-9, atol=1e-6
+)
+
+res = evaluate_state(sol.y[0])
+t_dropout = sol.t_events[0][0] if len(sol.t_events[0]) > 0 else None
+t_unchoke = sol.t_events[1][0] if len(sol.t_events[1]) > 0 else None
+
+
+impulse = np.trapezoid(res["thrust"], t) if hasattr(np, "trapezoid") else np.trapz(res["thrust"], t)
+m_left  = res["rho_tank"][-1] * V
+
+print(f"Regulator dropout (P_tank = P_reg) : {f'{t_dropout:.4f} s' if t_dropout else 'N/A'}")
+print(f"Nozzle unchokes (Stage I -> II)    : {f'{t_unchoke:.4f} s' if t_unchoke else 'N/A'}")
+print(f"Initial Thrust                     : {res['thrust'][0]:.2f} N")
+print(f"Total Impulse                      : {impulse:.2f} N·s")
+print(f"Gas remaining in tank              : {m_left*1e3:.2f} g / {m_1*1e3:.2f} g\n")
+
+
+t_samples = [0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
+idx = [np.argmin(np.abs(t - ts)) for ts in t_samples if ts <= t_end]
+df = pd.DataFrame({
+    "t [s]": t[idx],
+    "P_tank [bar]": res["P_tank"][idx] / 1e5,
+    "P_o [bar]": res["P_o"][idx] / 1e5,
+    "P_e [bar]": res["P_e"][idx] / 1e5,
+    "T_tank [K]": res["T_tank"][idx],
+    "M_e": res["M_e"][idx],
+    "mdot [g/s]": res["mdot"][idx] * 1e3,
+    "Thrust [N]": res["thrust"][idx]
+})
+print(df.round(4).to_string(index=False))
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
+
+axes[0, 0].plot(t, res["P_tank"] / 1e5, label="Tank Pressure ($P_{tank}$)")
+axes[0, 0].plot(t, res["P_o"] / 1e5, "--", label="Chamber Pressure ($P_o$)")
+axes[0, 0].axhline(P_atm / 1e5, color="r", ls=":", lw=1, label="Ambient ($P_{atm}$)")
+axes[0, 0].set_ylabel("Pressure [bar]")
+axes[0, 0].set_title("Tank vs. Regulated Chamber Pressure")
+axes[0, 0].legend()
+
+axes[0, 1].plot(t, res["thrust"], color="tab:orange")
+axes[0, 1].set_ylabel("Thrust [N]")
+axes[0, 1].set_title("Nozzle Thrust")
+
+axes[1, 0].plot(t, res["mdot"] * 1e3, color="tab:green")
+axes[1, 0].set_ylabel("Mass Flow Rate [g/s]")
+axes[1, 0].set_xlabel("Time [s]")
+axes[1, 0].set_title("Mass Flow Rate")
+
+axes[1, 1].plot(t, res["T_tank"], color="tab:red")
+axes[1, 1].set_ylabel("Temperature [K]")
+axes[1, 1].set_xlabel("Time [s]")
+axes[1, 1].set_title("Tank Gas Temperature")
+
+for ax in axes.flat:
+    ax.grid(alpha=0.3)
+    if t_dropout: ax.axvline(t_dropout, color="gray", ls="--", lw=1)
+    if t_unchoke: ax.axvline(t_unchoke, color="purple", ls=":", lw=1)
+
+fig.suptitle("Regulated Tank Blowdown (Dashed = Reg. Dropout, Dotted = Unchoke)")
+plt.tight_layout()
+plt.show()
